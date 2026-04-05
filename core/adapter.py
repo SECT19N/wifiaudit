@@ -86,32 +86,85 @@ def _check_monitor_capable(phy: str) -> bool:
     return "monitor" in stdout.lower()
 
 
+def _get_all_ifaces() -> set[str]:
+    """Return all current wireless interface names from iw dev."""
+    stdout, _, _ = _run(["iw", "dev"])
+    return set(re.findall(r"Interface\s+(\S+)", stdout))
+
+
+def _find_monitor_ifaces() -> list[str]:
+    """Return interfaces currently in monitor mode."""
+    stdout, _, _ = _run(["iw", "dev"])
+    result = []
+    current_iface = None
+    for line in stdout.splitlines():
+        m = re.match(r"\s+Interface\s+(\S+)", line)
+        if m:
+            current_iface = m.group(1)
+        t = re.match(r"\s+type\s+(\S+)", line)
+        if t and current_iface:
+            if t.group(1) == "monitor":
+                result.append(current_iface)
+            current_iface = None
+    return result
+
+
 def enable_monitor_mode(iface: str) -> tuple[bool, str]:
     """
     Enable monitor mode on given interface.
     Returns (success, monitor_interface_name).
-    Uses airmon-ng check kill first, then airmon-ng start.
+
+    Strategy:
+    1. Snapshot interfaces before
+    2. airmon-ng check kill + airmon-ng start
+    3. Snapshot after — the new or changed monitor iface is the answer
+    4. Fall back to iw set monitor if airmon-ng didn't create a new iface
     """
+    # Snapshot before
+    ifaces_before = _get_all_ifaces()
+    monitor_before = set(_find_monitor_ifaces())
+
     # Kill conflicting processes
-    _run(["airmon-ng", "check", "kill"])
+    kill_out, _, _ = _run(["airmon-ng", "check", "kill"])
 
+    # Start monitor mode
     stdout, stderr, rc = _run(["airmon-ng", "start", iface])
-    if rc != 0:
-        return False, stderr
 
-    # Parse new interface name (usually wlan0mon or wlan0)
-    mon_iface = iface + "mon"
-    for line in stdout.splitlines():
-        m = re.search(r"monitor mode vif enabled.*?on\s+\[(\w+)\]", line)
-        if m:
-            mon_iface = m.group(1)
-            break
-        m = re.search(r"monitor mode enabled on\s+(\w+)", line)
-        if m:
-            mon_iface = m.group(1)
-            break
+    # Give the kernel a moment to rename the interface
+    import time
 
-    return True, mon_iface
+    time.sleep(1)
+
+    # Snapshot after
+    ifaces_after = _get_all_ifaces()
+    monitor_after = set(_find_monitor_ifaces())
+
+    # New interfaces that appeared = the monitor vif airmon-ng created
+    new_ifaces = ifaces_after - ifaces_before
+    new_monitor = monitor_after - monitor_before
+
+    if new_monitor:
+        mon_iface = sorted(new_monitor)[0]
+        return True, mon_iface
+
+    if new_ifaces:
+        mon_iface = sorted(new_ifaces)[0]
+        return True, mon_iface
+
+    # airmon-ng may have converted the existing iface in-place (no rename)
+    # Check if the original iface is now in monitor mode
+    if iface in monitor_after:
+        return True, iface
+
+    # Last resort: try setting monitor mode directly with iw
+    _run(["ip", "link", "set", iface, "down"])
+    _, err, rc2 = _run(["iw", "dev", iface, "set", "type", "monitor"])
+    _run(["ip", "link", "set", iface, "up"])
+    if rc2 == 0:
+        return True, iface
+
+    # Give up — report what airmon-ng said
+    return False, stderr or stdout or "Unknown error enabling monitor mode."
 
 
 def disable_monitor_mode(mon_iface: str) -> tuple[bool, str]:

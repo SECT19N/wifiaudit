@@ -202,17 +202,22 @@ class AdapterTab(QWidget):
         self._refresh_btn.setEnabled(False)
         action = "Enabling" if enabling else "Disabling"
         self._log_msg(f"[*] {action} monitor mode on {self._selected_iface}...")
+        self._log_msg(
+            f"[*] Running: airmon-ng check kill && airmon-ng start {self._selected_iface}"
+        )
 
-        worker = AdapterWorker(self._selected_iface, enabling)
-        thread = QThread()
-        worker.moveToThread(thread)
-        worker.finished.connect(
+        # Store on self to prevent garbage collection before thread finishes
+        self._worker = AdapterWorker(self._selected_iface, enabling)
+        self._worker_thread = QThread()
+        self._worker.moveToThread(self._worker_thread)
+        self._worker.finished.connect(
             lambda ok, msg: self._on_monitor_done(ok, msg, enabling)
         )
-        worker.finished.connect(thread.quit)
-        thread.started.connect(worker.run)
-        thread.start()
-        self._worker_thread = thread
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker_thread.start()
 
     def _on_monitor_done(self, ok: bool, result: str, was_enabling: bool):
         self._monitor_btn.setEnabled(True)
@@ -220,13 +225,27 @@ class AdapterTab(QWidget):
         if ok:
             if was_enabling:
                 self._monitor_iface = result
-                self._log_msg(f"[✓] Monitor mode enabled → {result}")
+                self._log_msg(f"[✓] Monitor mode enabled → interface: {result}")
+                # Double-check by re-reading iw dev
+                import subprocess
+
+                iw_out = subprocess.run(
+                    ["iw", "dev"], capture_output=True, text=True
+                ).stdout
+                self._log_msg(f"[i] iw dev output:\n{iw_out.strip()}")
                 self._on_adapter_changed(result)
             else:
                 self._log_msg(f"[✓] Monitor mode disabled. {result}")
                 self._on_adapter_changed("")
         else:
             self._log_msg(f"[✗] Failed: {result}")
+            # Still dump iw dev so we can see actual state
+            import subprocess
+
+            iw_out = subprocess.run(
+                ["iw", "dev"], capture_output=True, text=True
+            ).stdout
+            self._log_msg(f"[i] iw dev output:\n{iw_out.strip()}")
         self._refresh_adapters()
 
     def _log_msg(self, msg: str):
