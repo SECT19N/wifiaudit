@@ -1,8 +1,3 @@
-"""
-core/scanner.py — Passive network scanner using airodump-ng
-Detects visible and hidden (SSID-less) networks.
-"""
-
 import csv
 import os
 import re
@@ -17,13 +12,13 @@ from typing import Callable, Optional
 @dataclass
 class AccessPoint:
     bssid: str
-    ssid: str  # Empty string = hidden SSID
+    ssid: str
     channel: int
     frequency: str
-    encryption: str  # WPA2, WPA, WEP, OPN
+    encryption: str
     cipher: str
     auth: str
-    power: int  # Signal in dBm (negative)
+    power: int
     beacons: int
     data_packets: int
     hidden: bool = False
@@ -37,7 +32,6 @@ class AccessPoint:
 
     @property
     def signal_bar(self) -> str:
-        """ASCII signal strength."""
         pwr = abs(self.power)
         if pwr < 50:
             return "████ Excellent"
@@ -51,34 +45,31 @@ class AccessPoint:
 
 
 class Scanner:
-    """
-    Runs airodump-ng in background, parses CSV output,
-    calls on_update(list[AccessPoint]) periodically.
-    """
-
     def __init__(
         self,
         iface: str,
         on_update: Callable,
         on_error: Optional[Callable[[str], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
         channel: int = 0,
-        band: str = "abg",  # a=5GHz, b/g=2.4GHz — abg covers both
     ):
         self.iface = iface
         self.on_update = on_update
         self.on_error = on_error
-        self.channel = channel
-        self.band = band
+        self.on_status = on_status
+        self.channel = int(channel) if channel else 0  # 🔥 force int
         self._proc: Optional[subprocess.Popen] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        self._status_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._tmpdir = tempfile.mkdtemp(prefix="wifiaudit_scan_")
+        self._tmpdir = tempfile.mkdtemp(prefix="scan_")
         self._prefix = os.path.join(self._tmpdir, "scan")
         self.access_points: dict[str, AccessPoint] = {}
 
     def start(self):
         self._stop_event.clear()
+
         cmd = [
             "airodump-ng",
             "--write",
@@ -86,14 +77,15 @@ class Scanner:
             "--output-format",
             "csv",
             "--write-interval",
-            "3",  # 3s — stable, no file contention
+            "1",  # 🔥 faster updates
+            "--ignore-negative-one",  # 🔥 driver fix
         ]
+
         if self.channel:
-            # Locked channel: fastest, no hopping at all
             cmd += ["--channel", str(self.channel)]
         else:
-            # Band flag: abg = both 2.4GHz (b/g) and 5GHz (a)
-            cmd += ["--band", self.band]
+            # 🔥 reliable hopping instead of --band
+            cmd += ["--channel", "1,2,3,4,5,6,7,8,9,10,11,36,40,44,48"]
 
         cmd.append(self.iface)
 
@@ -103,26 +95,68 @@ class Scanner:
             stderr=subprocess.PIPE,
             text=True,
         )
+
+        import time
+
+        time.sleep(1)
+        print("PROCESS POLL:", self._proc.poll())
+
         self._poll_thread = threading.Thread(target=self._poll_csv, daemon=True)
         self._poll_thread.start()
+
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
 
+        self._status_thread = threading.Thread(target=self._status_loop, daemon=True)
+        self._status_thread.start()
+
+    # 🔥 NEW: real status (based on observed data, not iw)
+    def _status_loop(self):
+        if not self.on_status:
+            return
+
+        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        tick = 0
+
+        while not self._stop_event.is_set():
+            spin = spinner[tick % len(spinner)]
+
+            if self.channel:
+                msg = f"{spin} Locked on channel {self.channel} · scanning…"
+            else:
+                channels = sorted(
+                    {ap.channel for ap in self.access_points.values() if ap.channel}
+                )
+                if channels:
+                    ch_str = ", ".join(map(str, channels[:6]))
+                    if len(channels) > 6:
+                        ch_str += "..."
+                    msg = f"{spin} Hopping · seen: {ch_str}"
+                else:
+                    msg = f"{spin} Hopping · scanning…"
+
+            self.on_status(msg)
+            tick += 1
+            time.sleep(0.7)
+
     def _drain_stderr(self):
-        """Surface airodump-ng errors through the on_error callback."""
         if not self._proc or not self._proc.stderr:
             return
+
         for line in self._proc.stderr:
-            if self._stop_event.is_set():
-                break
-            line = line.strip()
-            if line and self.on_error:
-                self.on_error(f"[airodump] {line}")
+            print("STDERR:", line.strip())  # 🔥 force print
+            if self.on_error:
+                self.on_error(f"[airodump] {line.strip()}")
 
     def _poll_csv(self):
         csv_path = self._prefix + "-01.csv"
+
+        print("CSV PATH:", csv_path)
+        print("EXISTS:", os.path.exists(csv_path))
+
         while not self._stop_event.is_set():
-            time.sleep(3)
+            time.sleep(1)
+
             if os.path.exists(csv_path):
                 try:
                     aps = self._parse_csv(csv_path)
@@ -134,113 +168,82 @@ class Scanner:
                         self.on_error(f"[scanner] parse error: {e}")
 
     def _parse_csv(self, path: str) -> list[AccessPoint]:
-        """
-        Parse airodump-ng CSV output.
-
-        The file has two sections separated by a blank line:
-          1. Access points  — header starts with 'BSSID'
-          2. Station/clients — header starts with 'Station MAC'
-
-        All column names after the first have a leading space, e.g. ' ESSID'.
-        We normalise by stripping every key before lookup.
-        """
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                raw = f.read()
-        except OSError:
-            return []
-
-        # Normalise line endings then split into sections on blank lines
-        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-        sections = re.split(r"\n[ \t]*\n", raw.strip())
-
         aps: list[AccessPoint] = []
 
-        if not sections:
-            return aps
-
-        # ── AP section ──
-        ap_lines = [l for l in sections[0].splitlines() if l.strip()]
-        if len(ap_lines) < 2:
-            return aps
-
         try:
-            reader = csv.DictReader(ap_lines)
-            for row in reader:
-                # Normalise keys: strip whitespace, lowercase
-                r = {k.strip().lower(): v.strip() for k, v in row.items() if k}
+            with open(path, newline="", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
 
-                bssid = r.get("bssid", "")
-                if not bssid or bssid.lower() == "bssid":
-                    continue
-                # Must look like a MAC address
-                if not re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", bssid):
-                    continue
+                headers = None
 
-                ssid = r.get("essid", "")
-                # Hidden: empty, all-null-bytes, or whitespace only
-                hidden = (
-                    not ssid
-                    or not ssid.strip()
-                    or all(c == "\x00" for c in ssid)
-                    or re.match(r"^[\x00\s]+$", ssid) is not None
-                )
+                for row in reader:
+                    if not row:
+                        continue
 
-                def _int(key: str, fallback: int = 0) -> int:
-                    try:
-                        return int(r.get(key, str(fallback)))
-                    except ValueError:
-                        return fallback
+                    # Detect AP header
+                    if row[0].strip().lower() == "bssid":
+                        headers = [h.strip().lower() for h in row]
+                        continue
 
-                ap = AccessPoint(
-                    bssid=bssid,
-                    ssid=ssid if not hidden else "",
-                    channel=_int("channel"),
-                    frequency="",
-                    encryption=r.get("privacy", ""),
-                    cipher=r.get("cipher", ""),
-                    auth=r.get("authentication", ""),
-                    power=_int("power", -100),
-                    beacons=_int("# beacons"),
-                    data_packets=_int("# iv"),
-                    hidden=hidden,
-                )
-                aps.append(ap)
-        except Exception:
-            pass
+                    # Stop at station section
+                    if row[0].strip().lower().startswith("station mac"):
+                        break
 
-        # ── Station / client section ──
-        if len(sections) > 1:
-            sta_lines = [l for l in sections[1].splitlines() if l.strip()]
-            if len(sta_lines) >= 2:
-                try:
-                    sta_reader = csv.DictReader(sta_lines)
-                    ap_map = {ap.bssid: ap for ap in aps}
-                    for row in sta_reader:
-                        r = {k.strip().lower(): v.strip() for k, v in row.items() if k}
-                        mac = r.get("station mac", "")
-                        assoc_bssid = r.get("bssid", "")
-                        if (
-                            mac
-                            and assoc_bssid
-                            and assoc_bssid != "(not associated)"
-                            and assoc_bssid in ap_map
-                        ):
-                            if mac not in ap_map[assoc_bssid].clients:
-                                ap_map[assoc_bssid].clients.append(mac)
-                except Exception:
-                    pass
+                    if not headers:
+                        continue
+
+                    # 🔥 Skip broken/incomplete rows safely
+                    if len(row) < len(headers):
+                        continue
+
+                    data = dict(zip(headers, [c.strip() for c in row]))
+
+                    bssid = data.get("bssid", "")
+                    if not re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", bssid):
+                        continue
+
+                    ssid = data.get("essid", "")
+                    hidden = not ssid or not ssid.strip() or "\x00" in ssid
+
+                    def _int(k, d=0):
+                        try:
+                            return int(data.get(k, d))
+                        except:
+                            return d
+
+                    aps.append(
+                        AccessPoint(
+                            bssid=bssid,
+                            ssid="" if hidden else ssid,
+                            channel=_int("channel"),
+                            frequency="",
+                            encryption=data.get("privacy", ""),
+                            cipher=data.get("cipher", ""),
+                            auth=data.get("authentication", ""),
+                            power=_int("power", -100),
+                            beacons=_int("# beacons"),
+                            data_packets=_int("# iv"),
+                            hidden=hidden,
+                        )
+                    )
+
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"[parse] {e}")
 
         return aps
 
     def stop(self):
         self._stop_event.set()
+
         if self._proc:
             self._proc.terminate()
             self._proc.wait()
-        if self._thread:
-            self._thread.join(timeout=3)
-        # Cleanup temp files
+
+        for t in (self._poll_thread, self._stderr_thread, self._status_thread):
+            if t:
+                t.join(timeout=2)
+
         import shutil
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)
