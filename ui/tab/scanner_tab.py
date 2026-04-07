@@ -223,17 +223,25 @@ class ScannerTab(QWidget):
             self._scan_btn.style().polish(self._scan_btn)
         else:
             ch = self._ch_combo.currentData()
-            self._scanner = Scanner(iface, self._on_scan_update, channel=ch)
+            self._scanner = Scanner(
+                iface=iface,
+                on_update=self._on_scan_update,
+                on_error=self._on_scan_error,
+                channel=ch,
+                band="abg",  # always scan both 2.4GHz and 5GHz
+            )
             self._scanner.start()
             self._scan_btn.setText("■  Stop Scan")
             self._scan_btn.setObjectName("dangerBtn")
             self._scan_btn.style().unpolish(self._scan_btn)
             self._scan_btn.style().polish(self._scan_btn)
-            self._iface_label.setText(f"Scanning on {iface}")
+            self._iface_label.setText(f"Scanning on {iface}  (2.4GHz + 5GHz)")
 
     def _on_scan_update(self, aps: list[AccessPoint]):
-        # Must update UI from main thread
         QTimer.singleShot(0, lambda: self._update_table(aps))
+
+    def _on_scan_error(self, msg: str):
+        QTimer.singleShot(0, lambda: self._detail.append(msg))
 
     def _update_table(self, aps: list[AccessPoint]):
         self._aps = sorted(aps, key=lambda a: a.power, reverse=True)  # strongest first

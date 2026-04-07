@@ -5,6 +5,7 @@ Detects visible and hidden (SSID-less) networks.
 
 import csv
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -55,14 +56,24 @@ class Scanner:
     calls on_update(list[AccessPoint]) periodically.
     """
 
-    def __init__(self, iface: str, on_update: Callable, channel: int = 0):
+    def __init__(
+        self,
+        iface: str,
+        on_update: Callable,
+        on_error: Optional[Callable[[str], None]] = None,
+        channel: int = 0,
+        band: str = "abg",  # a=5GHz, b/g=2.4GHz — abg covers both
+    ):
         self.iface = iface
         self.on_update = on_update
+        self.on_error = on_error
         self.channel = channel
+        self.band = band
         self._proc: Optional[subprocess.Popen] = None
-        self._thread: Optional[threading.Thread] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._tmpdir = tempfile.mkdtemp(prefix="wifiaudit_")
+        self._tmpdir = tempfile.mkdtemp(prefix="wifiaudit_scan_")
         self._prefix = os.path.join(self._tmpdir, "scan")
         self.access_points: dict[str, AccessPoint] = {}
 
@@ -75,109 +86,150 @@ class Scanner:
             "--output-format",
             "csv",
             "--write-interval",
-            "1",
+            "3",  # 3s — stable, no file contention
         ]
         if self.channel:
+            # Locked channel: fastest, no hopping at all
             cmd += ["--channel", str(self.channel)]
+        else:
+            # Band flag: abg = both 2.4GHz (b/g) and 5GHz (a)
+            cmd += ["--band", self.band]
+
         cmd.append(self.iface)
 
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        self._thread = threading.Thread(target=self._poll_csv, daemon=True)
-        self._thread.start()
+        self._poll_thread = threading.Thread(target=self._poll_csv, daemon=True)
+        self._poll_thread.start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        """Surface airodump-ng errors through the on_error callback."""
+        if not self._proc or not self._proc.stderr:
+            return
+        for line in self._proc.stderr:
+            if self._stop_event.is_set():
+                break
+            line = line.strip()
+            if line and self.on_error:
+                self.on_error(f"[airodump] {line}")
 
     def _poll_csv(self):
         csv_path = self._prefix + "-01.csv"
         while not self._stop_event.is_set():
-            time.sleep(1.5)
+            time.sleep(3)
             if os.path.exists(csv_path):
-                aps = self._parse_csv(csv_path)
-                self.access_points = {ap.bssid: ap for ap in aps}
-                self.on_update(list(self.access_points.values()))
+                try:
+                    aps = self._parse_csv(csv_path)
+                    if aps:
+                        self.access_points = {ap.bssid: ap for ap in aps}
+                        self.on_update(list(self.access_points.values()))
+                except Exception as e:
+                    if self.on_error:
+                        self.on_error(f"[scanner] parse error: {e}")
 
     def _parse_csv(self, path: str) -> list[AccessPoint]:
-        aps = []
-        clients_section = False
-        client_rows = []
+        """
+        Parse airodump-ng CSV output.
 
+        The file has two sections separated by a blank line:
+          1. Access points  — header starts with 'BSSID'
+          2. Station/clients — header starts with 'Station MAC'
+
+        All column names after the first have a leading space, e.g. ' ESSID'.
+        We normalise by stripping every key before lookup.
+        """
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                content = f.read()
+                raw = f.read()
         except OSError:
-            return aps
+            return []
 
-        sections = content.split("\r\n\r\n")
+        # Normalise line endings then split into sections on blank lines
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        sections = re.split(r"\n[ \t]*\n", raw.strip())
+
+        aps: list[AccessPoint] = []
+
         if not sections:
             return aps
 
-        # ── AP Section ──
-        ap_lines = sections[0].strip().splitlines()
+        # ── AP section ──
+        ap_lines = [l for l in sections[0].splitlines() if l.strip()]
         if len(ap_lines) < 2:
             return aps
 
-        reader = csv.DictReader(ap_lines)
-        for row in reader:
-            try:
-                bssid = row.get(" BSSID", row.get("BSSID", "")).strip()
-                if not bssid or bssid == "BSSID":
-                    continue
-                ssid = row.get(" ESSID", "").strip()
-                hidden = ssid == "" or ssid == "\\x00" * len(ssid)
-                try:
-                    pwr = int(row.get(" Power", "-100").strip())
-                except ValueError:
-                    pwr = -100
-                try:
-                    ch = int(row.get(" channel", "0").strip())
-                except ValueError:
-                    ch = 0
-                try:
-                    beacons = int(row.get(" # beacons", "0").strip())
-                except ValueError:
-                    beacons = 0
-                try:
-                    data = int(row.get(" # IV", "0").strip())
-                except ValueError:
-                    data = 0
+        try:
+            reader = csv.DictReader(ap_lines)
+            for row in reader:
+                # Normalise keys: strip whitespace, lowercase
+                r = {k.strip().lower(): v.strip() for k, v in row.items() if k}
 
-                enc = row.get(" Privacy", "").strip()
-                cipher = row.get(" Cipher", "").strip()
-                auth = row.get(" Authentication", "").strip()
+                bssid = r.get("bssid", "")
+                if not bssid or bssid.lower() == "bssid":
+                    continue
+                # Must look like a MAC address
+                if not re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", bssid):
+                    continue
+
+                ssid = r.get("essid", "")
+                # Hidden: empty, all-null-bytes, or whitespace only
+                hidden = (
+                    not ssid
+                    or not ssid.strip()
+                    or all(c == "\x00" for c in ssid)
+                    or re.match(r"^[\x00\s]+$", ssid) is not None
+                )
+
+                def _int(key: str, fallback: int = 0) -> int:
+                    try:
+                        return int(r.get(key, str(fallback)))
+                    except ValueError:
+                        return fallback
 
                 ap = AccessPoint(
                     bssid=bssid,
-                    ssid=ssid,
-                    channel=ch,
+                    ssid=ssid if not hidden else "",
+                    channel=_int("channel"),
                     frequency="",
-                    encryption=enc,
-                    cipher=cipher,
-                    auth=auth,
-                    power=pwr,
-                    beacons=beacons,
-                    data_packets=data,
+                    encryption=r.get("privacy", ""),
+                    cipher=r.get("cipher", ""),
+                    auth=r.get("authentication", ""),
+                    power=_int("power", -100),
+                    beacons=_int("# beacons"),
+                    data_packets=_int("# iv"),
                     hidden=hidden,
                 )
                 aps.append(ap)
-            except Exception:
-                continue
+        except Exception:
+            pass
 
-        # ── Client Section ──
+        # ── Station / client section ──
         if len(sections) > 1:
-            client_lines = sections[1].strip().splitlines()
-            client_reader = csv.DictReader(client_lines)
-            for row in client_reader:
+            sta_lines = [l for l in sections[1].splitlines() if l.strip()]
+            if len(sta_lines) >= 2:
                 try:
-                    mac = row.get(" Station MAC", "").strip()
-                    assoc = row.get(" BSSID", "").strip()
-                    if mac and assoc and assoc != "(not associated)":
-                        for ap in aps:
-                            if ap.bssid == assoc:
-                                ap.clients.append(mac)
+                    sta_reader = csv.DictReader(sta_lines)
+                    ap_map = {ap.bssid: ap for ap in aps}
+                    for row in sta_reader:
+                        r = {k.strip().lower(): v.strip() for k, v in row.items() if k}
+                        mac = r.get("station mac", "")
+                        assoc_bssid = r.get("bssid", "")
+                        if (
+                            mac
+                            and assoc_bssid
+                            and assoc_bssid != "(not associated)"
+                            and assoc_bssid in ap_map
+                        ):
+                            if mac not in ap_map[assoc_bssid].clients:
+                                ap_map[assoc_bssid].clients.append(mac)
                 except Exception:
-                    continue
+                    pass
 
         return aps
 
